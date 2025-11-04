@@ -246,7 +246,11 @@ actor_rollout_ref:
 
       # For more flexibility, you can specify the contents to load from the checkpoint.
       load_contents: ${actor_rollout_ref.actor.checkpoint.save_contents}
-
+    
+    alpha_lr: 1e-2
+    debug: False
+    use_target_lst: False
+    sft_loss_coef: 1.0
     # optimizer configs
     optim:
 

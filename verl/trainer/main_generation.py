@@ -38,7 +38,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.hdfs_io import makedirs
 from verl.utils.model import compute_position_id_with_mask
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
-
+from tqdm import tqdm
 
 @hydra.main(config_path="config", config_name="generation", version_base=None)
 def main(config):
@@ -91,14 +91,26 @@ def main_task(config):
     total_samples = len(dataset)
     config_batch_size = config.data.batch_size
     num_batch = -(-total_samples // config_batch_size)
+    
+    output_dir = os.path.dirname(config.data.output_path)
+    makedirs(output_dir, exist_ok=True)
     output_lst = [[] for _ in range(config.data.n_samples)]
 
-    for batch_idx in range(num_batch):
-        print(f"[{batch_idx + 1}/{num_batch}] Start to process.")
-        batch_chat_lst = chat_lst[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
+    for batch_idx in tqdm(range(num_batch), desc="Generating Batches"):
+        if (batch_idx + 1) > config.max_steps:
+            print(f"Reached max steps {config.max_steps}, stopping generation.")
+            break
+        #print(f"[{batch_idx + 1}/{num_batch}] Start to process.")
+        start_idx = batch_idx * config_batch_size
+        end_idx = (batch_idx + 1) * config_batch_size
+        
+        # 1. 获取当前批次的数据
+        batch_dataset = dataset.iloc[start_idx:end_idx].copy()
+        batch_chat_lst = chat_lst[start_idx:end_idx]
+        #batch_chat_lst = chat_lst[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
         inputs = tokenizer.apply_chat_template(
             batch_chat_lst,
-            add_generation_prompt=True,
+            add_generation_prompt=False,
             padding=True,
             truncation=True,
             max_length=config.rollout.prompt_length,
@@ -116,6 +128,7 @@ def main_task(config):
 
         # START TO GENERATE FOR n_samples TIMES
         print(f"[{batch_idx + 1}/{num_batch}] Start to generate.")
+        batch_output_lst = [[] for _ in range(config.data.n_samples)]
         for n_sample in range(config.data.n_samples):
             output_padded = wg.generate_sequences(data_padded)
             output = unpad_dataproto(output_padded, pad_size=pad_size)
@@ -129,19 +142,76 @@ def main_task(config):
                 response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
                 output_texts.append(response_str)
 
-            output_lst[n_sample].extend(output_texts)
+            #output_lst[n_sample].extend(output_texts)
+            batch_output_lst[n_sample].extend(output_texts)
 
     # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
-    output_lst = np.array(output_lst, dtype=object)
-    output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
-
+    # output_lst = np.array(output_lst, dtype=object)
+    # output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
+        batch_output_lst = np.array(batch_output_lst, dtype=object)
+        batch_output_lst = np.transpose(batch_output_lst, axes=(1, 0)).tolist()
+        batch_dataset
     # add to the data frame
-    dataset["responses"] = output_lst
+        batch_dataset["responses"] = batch_output_lst
+        if config.is_eval == True:
+            # evaluate if needed
+            print("Start to evaluate generated results.")
+            from verl.custom.math_verify_reward import math_select_rm_score_fn
 
+            #compute_score = math_select_rm_score_fn
+
+            score_lst = []
+            data_sources = batch_dataset[config.data.data_source_key]
+            reward_dataset = batch_dataset[config.data.reward_model_key]
+            responses_lst = batch_dataset["responses"]
+            for i in range(len(batch_dataset)):
+                data_source = data_sources.iloc[i]
+                reward_data = reward_dataset.iloc[i]
+                responses = responses_lst.iloc[i]
+                ground_truth = reward_data["ground_truth"]
+                compute_score = math_select_rm_score_fn(data_source, reward_impl_version=config.reward_model.reward_impl_version)
+                score_per_response = [compute_score(data_source, r, ground_truth) for r in responses]
+                score_lst.append({
+                    "scores_per_response": score_per_response,
+                    "mean_score": np.mean(score_per_response),
+                })
+            batch_dataset["test_score"] = score_lst
+            #打印当前批次的平均分数
+            batch_mean_scores = [score["mean_score"] for score in score_lst]
+            batch_average_score = np.mean(batch_mean_scores)
+            print(f"Batch {batch_idx} average score: {batch_average_score}")
+        # 5. 将当前批次的结果保存到独立文件
+        batch_output_filename = f"{batch_idx}.parquet"
+        batch_output_path = os.path.join(output_dir, batch_output_filename)
+        batch_dataset.to_parquet(batch_output_path)
+        tqdm.write(f"Batch {batch_idx} saved to {batch_output_path}")
+    print("All batches have been processed and saved.")
+    # if config.is_eval == True:
+    #     # evaluate if needed
+    #     print("Start to evaluate generated results.")
+    #     from verl.custom.math_verify_reward import math_select_rm_score_fn
+
+    #     #compute_score = math_select_rm_score_fn
+
+    #     score_lst = []
+    #     data_sources = dataset[config.data.data_source_key]
+    #     reward_dataset = dataset[config.data.reward_model_key]
+    #     responses_lst = dataset["responses"]
+    #     for i in range(len(dataset)):
+    #         data_source = data_sources.iloc[i]
+    #         reward_data = reward_dataset.iloc[i]
+    #         responses = responses_lst.iloc[i]
+    #         ground_truth = reward_data["ground_truth"]
+    #         compute_score = math_select_rm_score_fn(data_source, reward_impl_version=config.reward_model.reward_impl_version)
+    #         score_per_response = [compute_score(data_source, r, ground_truth) for r in responses]
+    #         score_lst.append({
+    #             "scores_per_response": score_per_response,
+    #             "mean_score": np.mean(score_per_response),
+    #         })
+    #     dataset["test_score"] = score_lst
     # write to a new parquet
-    output_dir = os.path.dirname(config.data.output_path)
-    makedirs(output_dir, exist_ok=True)
-    dataset.to_parquet(config.data.output_path)
+    
+    #dataset.to_parquet(config.data.output_path)
 
 
 if __name__ == "__main__":

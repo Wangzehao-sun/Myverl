@@ -183,12 +183,13 @@ class vLLMRollout(BaseRollout):
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
+            if k == 'n':
+                continue
+            if hasattr(SamplingParams(), str(k)) :
                 kwargs[k] = config.get(k)
-
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
-
+        self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
 
     @contextmanager
@@ -255,6 +256,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        is_se = prompts.meta_info.get("is_se", False)
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -270,6 +272,13 @@ class vLLMRollout(BaseRollout):
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
+                "n": 1,  # if validate, already repeat in ray_trainer
+            }
+        if is_se:
+            kwargs={
+                "top_k": self.config.se_top_k,
+                "top_p": self.config.se_top_p,
+                "temperature": 1,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
@@ -291,7 +300,7 @@ class vLLMRollout(BaseRollout):
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-
+            
             response = []
             rollout_log_probs = []
             for output in outputs:
@@ -305,6 +314,7 @@ class vLLMRollout(BaseRollout):
                         rollout_log_probs.append(curr_log_prob)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
+            print(f"response shape: {response.shape}")
             if self.config.calculate_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)

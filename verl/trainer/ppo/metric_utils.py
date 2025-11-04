@@ -47,7 +47,7 @@ def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
     return reduce_metrics(metrics)
 
 
-def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
+def _compute_response_info(batch: DataProto,prefix_mask=None) -> Dict[str, Any]:
     """
     Computes information about prompts and responses from a batch.
 
@@ -62,18 +62,24 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
             - prompt_length: Tensor of prompt lengths for each item in the batch
             - response_length: Tensor of response lengths for each item in the batch
     """
+    if prefix_mask is None:
+        prefix_mask = batch.batch["prefix_mask"].bool()
     response_length = batch.batch["responses"].shape[-1]
-
+    off_policy_mask = prefix_mask.any(-1)
+    on_policy_mask = ~off_policy_mask
     prompt_mask = batch.batch["attention_mask"][:, :-response_length]
     response_mask = batch.batch["attention_mask"][:, -response_length:]
 
     prompt_length = prompt_mask.sum(-1).float()
     response_length = response_mask.sum(-1).float()  # (batch_size,)
-
+    response_length_off = response_mask[off_policy_mask].sum(-1).float()
+    response_length_on = response_mask[on_policy_mask].sum(-1).float()
     return dict(
         response_mask=response_mask,
         prompt_length=prompt_length,
         response_length=response_length,
+        response_length_off=response_length_off,
+        response_length_on=response_length_on,
     )
 
 
@@ -102,7 +108,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
-
+    prefix_mask = batch.batch["prefix_mask"].bool()
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
 
@@ -112,11 +118,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
 
     max_prompt_length = prompt_mask.size(-1)
-
-    response_info = _compute_response_info(batch)
+    #off_policy_mask = 
+    response_info = _compute_response_info(batch ,prefix_mask)
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
-
+    response_length_off = response_info["response_length_off"]
+    response_length_on = response_info["response_length_on"]
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
@@ -157,6 +164,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         ),
         # response length
         "response_length/mean": torch.mean(response_length).detach().item(),
+        "response_length/on_mean": torch.mean(response_length_on).detach().item(),
+        "response_length/off_mean": torch.mean(response_length_off).detach().item(),
         "response_length/max": torch.max(response_length).detach().item(),
         "response_length/min": torch.min(response_length).detach().item(),
         "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),

@@ -104,7 +104,7 @@ class RLHFDataset(Dataset):
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
-        self.return_full_prompt = config.get("return_full_prompt", False)
+        self.return_full_prompt = config.get("return_full_prompt", True)
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
 
@@ -257,7 +257,9 @@ class RLHFDataset(Dataset):
             raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
+            #print( input_ids.shape)
             attention_mask = model_inputs.pop("attention_mask")
+            #print( attention_mask.shape)
 
         if not self.processor_type == "MiniCPMVImageProcessor":
             input_ids, attention_mask = verl_F.postprocess_data(
@@ -326,6 +328,7 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        #print(row_dict)
         return row_dict
 
     def __getstate__(self):
