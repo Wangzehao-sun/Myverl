@@ -5,12 +5,15 @@ unset ROCR_VISIBLE_DEVICES
 echo $HOME
 export RAY_DEDUP_LOGS=0
 export WANDB_MODE=offline
-train_path=$HOME/LLM/Train/data/deepmath_filter2_se_prompt.parquet
-test_path=$HOME/LLM/Train/data/valid.parquet
+train_path=$HOME/LLM/Train/data/s1K_se_standard.parquet
+test_path=$HOME/LLM/Train/data/valid_with_aime25.parquet
+test1_path=$HOME/LLM/Train/data/split_by_source/aime.parquet
+test2_path=$HOME/LLM/Train/data/split_by_source/aime25.parquet
 train_files="['$train_path']"
 val_files="['$test_path']"
+#val_files="['$test1_path','$test2_path']"
 
-name="luffy"
+name="vanilla"
 
 MODEL_DIR=/home/jwangxgroup/jiewang/shared
 MODEL_PATH=$MODEL_DIR/${1:-"Qwen2.5-Math-7B-16k-think"} #Model/Qwen2.5-Math-7B-16k-think
@@ -42,9 +45,9 @@ python -m verl.trainer.main_ppo_new \
     algorithm.norm_adv_by_std_in_grpo=False \
     +algorithm.filter_reward=False \
     data.train_files=$train_files \
-    data.val_files=$val_files \
+    data.val_files="$val_files" \
     data.train_batch_size=128 \
-    data.val_batch_size=512 \
+    data.val_batch_size=256 \
     data.max_prompt_length=2048 \
     data.max_response_length=10240 \
     data.return_full_prompt=True \
@@ -95,19 +98,19 @@ python -m verl.trainer.main_ppo_new \
     +actor_rollout_ref.rollout.se_top_p=1 \
     +actor_rollout_ref.rollout.n_val=1 \
     +actor_rollout_ref.rollout.max_prefix_len=10240 \
-    +actor_rollout_ref.rollout.n_off=1 \
-    +actor_rollout_ref.rollout.n_prefix=1 \
+    +actor_rollout_ref.rollout.n_off=0 \
+    +actor_rollout_ref.rollout.n_prefix=0 \
     +actor_rollout_ref.rollout.n_se=0 \
     +actor_rollout_ref.rollout.prefix_ratio=1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="$PROJECT_NAME" \
     trainer.experiment_name="$EXP_NAME" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.n_gpus_per_node=$GPU_NUM \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
-    trainer.test_freq=100 \
+    trainer.save_freq=30 \
+    trainer.test_freq=10 \
     trainer.balance_batch=False \
     trainer.rollout_data_dir=$LOG_DIR/rollout_data \
     +trainer.log_prob_dir=$LOG_DIR/log_probs \

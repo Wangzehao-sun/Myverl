@@ -2,13 +2,14 @@
 **/*.pt
 **/checkpoints
 **/wget-log
+**/tensorboard_log
 **/_build/
 **/*.ckpt
 **/outputs
 **/*.tar.gz
 **/playground
 **/wandb
-**/logs
+./logs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -121,7 +122,9 @@ ENV/
 
 
 # local logs
+tensorboard_log
 logs
 log
 outputs
 .history
+*.whl

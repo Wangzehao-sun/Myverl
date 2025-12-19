@@ -155,7 +155,9 @@ class TaskRunner:
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
-
+        if config.se_model.enable:
+            role_worker_mapping[Role.ActorRolloutSE] = ray.remote(actor_rollout_cls)
+            mapping[Role.ActorRolloutSE] = global_pool_id
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))

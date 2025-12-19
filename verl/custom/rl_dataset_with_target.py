@@ -74,6 +74,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  tokenizer: PreTrainedTokenizer,
                  config: DictConfig,
                  target_key='target',
+                 se_target_key='se_target',  # 新增: SE target 的列名
                  max_target_length=8192,
                  filter_targets=False,
                  sample_target_ratio=1.0,
@@ -81,18 +82,45 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  max_num_targets=5,
                  target_probs_key='target_ds_qwen_7b_probs',
                  se_prompt_key='se_prompt',  # 新增: 保存 SE prompt 的列名
+                 use_se=False,
         ):
         super().__init__(parquet_files, tokenizer, config=config)
         
         self.max_target_length = max_target_length
         self.filter_targets = filter_targets
         self.target_key = target_key
+        self.se_target_key = se_target_key  # 新增: 保存 SE target 的列名
         self.se_prompt_key = se_prompt_key  # 新增: 保存 SE prompt 的列名
         self.sample_target_ratio = sample_target_ratio
         self.target_list_key = target_list_key
         self.target_probs_key = target_probs_key
         self.max_num_targets = max_num_targets
+        self.use_se = use_se
+        if self.filter_targets:
+            self._filter_targets()
+    def _filter_targets(self):
+        # 将需要的变量提取到局部作用域，以便在 filter 函数中使用
+        tokenizer = self.tokenizer
+        target_key = self.target_key
+        
+        def target2len(doc) -> int:
+            tgt = doc.get(target_key)
+            # 如果 target 不存在或为空，返回 0 长度（即保留该样本）
+            if tgt is None or not isinstance(tgt, list) or len(tgt) == 0:
+                return 0
+            return len(tokenizer.apply_chat_template(doc[target_key], add_generation_prompt=True))
+            # 获取第一个 target 的内容
+            #content = tgt[0].get('content', '')
+            # 计算 token 长度 (不添加 special tokens)
+            #return len(tokenizer(content, add_special_tokens=False)['input_ids'])
 
+        # 使用 datasets 库的高效 filter 方法
+        self.dataframe = self.dataframe.filter(
+            lambda doc: target2len(doc) <= self.max_target_length,
+            num_proc=self.num_workers,  # 利用父类中定义的 num_workers 进行多进程处理
+            desc=f"Filtering targets longer than {self.max_target_length} tokens",
+        )
+        print(f"filter dataset len: {len(self.dataframe)}")
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
@@ -110,43 +138,77 @@ class RLHFDatasetWithTarget(RLHFDataset):
         # 因为父类可能已经从 `row_dict` 中 pop 了一些键，
         # 所以我们从最原始的数据源 `self.dataframe[item]` 中重新获取 target 相关字段。
         original_row: dict = self.dataframe[item]
-        if self.se_prompt_key in original_row:
-            se_prompt_messages = original_row.pop(self.se_prompt_key)
-            #print("se_prompt_messages:", se_prompt_messages)
-            if se_prompt_messages:
-                # 1. 应用聊天模板，与父类处理标准 prompt 的方式保持一致
-                messages = se_prompt_messages
-                se_full_prompt = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                
-                # 2. 分词
-                se_input_ids = self.tokenizer(se_full_prompt, add_special_tokens=False, return_tensors='pt')['input_ids']
+        if self.use_se:
+            if self.se_prompt_key in original_row:
+                se_prompt_messages = original_row.pop(self.se_prompt_key)
+                #print("se_prompt_messages:", se_prompt_messages)
+                if se_prompt_messages:
+                    # 1. 应用聊天模板，与父类处理标准 prompt 的方式保持一致
+                    messages = se_prompt_messages
+                    se_full_prompt = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    
+                    # 2. 分词
+                    se_input_ids = self.tokenizer(se_full_prompt, add_special_tokens=False, return_tensors='pt')['input_ids']
 
-                # 3. 填充或截断，与标准 prompt 使用相同的最大长度
-                se_input_ids = pad_sequence_to_length(
-                    se_input_ids,
-                    max_seq_len=self.max_target_length,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    left_pad=True  # prompt 通常进行左填充
-                )
-                
-                # 4. 计算 attention_mask 和 position_ids
-                se_attention_mask = (se_input_ids != self.tokenizer.pad_token_id).to(se_input_ids.dtype)
-                se_position_ids = compute_position_id_with_mask(se_attention_mask)
-                # 5. 添加到 row_dict 中
-                row_dict['se_input_ids'] = se_input_ids.squeeze(0)
-                row_dict['se_attention_mask'] = se_attention_mask.squeeze(0)
-                row_dict['se_position_ids'] = se_position_ids.squeeze(0)
-            else:
-                # 如果 se_prompt 为空，则创建与标准 prompt 形状相同的填充张量
-                row_dict['se_input_ids'] = torch.full_like(row_dict['input_ids'], self.tokenizer.pad_token_id)
-                row_dict['se_attention_mask'] = torch.zeros_like(row_dict['attention_mask'])
-                row_dict['se_position_ids'] = torch.zeros_like(row_dict['position_ids'])
-                # 5. 添加到 row_dict 中
-        # 步骤 3: 处理核心的 `target` 序列 (tgt_input_ids)
+                    # 3. 填充或截断，与标准 prompt 使用相同的最大长度
+                    if se_input_ids.shape[-1] < self.max_target_length:
+                        se_input_ids = pad_sequence_to_length(
+                            se_input_ids,
+                            max_seq_len=self.max_target_length,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            left_pad=True  # prompt 通常进行左填充
+                        )
+                    else:
+                        assert self.truncation in ('right', 'error')
+                        se_input_ids = se_input_ids[:, :self.max_target_length]
+                    
+                    
+                    # 4. 计算 attention_mask 和 position_ids
+                    se_attention_mask = (se_input_ids != self.tokenizer.pad_token_id).to(se_input_ids.dtype)
+                    se_position_ids = compute_position_id_with_mask(se_attention_mask)
+                    # 5. 添加到 row_dict 中
+                    row_dict['se_input_ids'] = se_input_ids.squeeze(0)
+                    row_dict['se_attention_mask'] = se_attention_mask.squeeze(0)
+                    row_dict['se_position_ids'] = se_position_ids.squeeze(0)
+                else:
+                    # 如果 se_prompt 为空，则创建与标准 prompt 形状相同的填充张量
+                    row_dict['se_input_ids'] = torch.full_like(row_dict['input_ids'], self.tokenizer.pad_token_id)
+                    row_dict['se_attention_mask'] = torch.zeros_like(row_dict['attention_mask'])
+                    row_dict['se_position_ids'] = torch.zeros_like(row_dict['position_ids'])
+                    # 5. 添加到 row_dict 中
+            
+            if self.se_target_key in original_row:
+                se_target_messages = original_row.pop(self.se_target_key)
+                if se_target_messages:
+                    # 1. 应用聊天模板，与父类处理标准 prompt 的方式保持一致
+                    se_tgt = se_target_messages[0]
+
+                    
+                    # 2. 分词
+                    se_tgt_input_ids = self.tokenizer(se_tgt['content'], add_special_tokens=False, return_tensors='pt')['input_ids']
+
+                    # 3. 填充或截断，与标准 prompt 使用相同的最大长度
+                    if se_tgt_input_ids.shape[-1] < self.max_target_length:
+                        se_tgt_input_ids = pad_sequence_to_length(
+                            se_tgt_input_ids,
+                            max_seq_len=self.max_target_length,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            left_pad=False  # target 通常进行右填充
+                        )
+                    else:
+                        assert self.truncation in ('right', 'error')
+                        se_tgt_input_ids = se_tgt_input_ids[:, :self.max_target_length]
+                    
+                    # 4. 添加到 row_dict 中
+                    row_dict['se_tgt_input_ids'] = se_tgt_input_ids.squeeze(0)
+                else:
+                    # 如果 se_target 为空，则创建与标准 prompt 形状相同的填充张量
+                    row_dict['se_tgt_input_ids'] = torch.full((self.max_target_length,), self.tokenizer.pad_token_id, dtype=torch.long)
+            # 步骤 3: 处理核心的 `target` 序列 (tgt_input_ids)
         # 这部分逻辑与你原来的代码几乎完全相同，因为这是子类的核心功能。
         tgt = original_row.get(self.target_key)
         sample = np.random.rand() < self.sample_target_ratio

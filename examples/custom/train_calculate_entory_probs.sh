@@ -5,13 +5,15 @@ unset ROCR_VISIBLE_DEVICES
 echo $HOME
 export RAY_DEDUP_LOGS=0
 export WANDB_MODE=offline
-train_path=$HOME/LLM/Train/data/openr1.parquet
+train_path=$HOME/LLM/Train/data/deepmath_filter2_se2_standard_tgt.parquet
 test_path=$HOME/LLM/Train/data/valid.parquet
 train_files="['$train_path']"
 val_files="['$test_path']"
 
 name="luffy_se"
-MODEL_PATH=${1:-"$HOME/Model/Qwen2.5-Math-7B-16k-think"} #Model/Qwen2.5-Math-7B-16k-think
+MODEL_DIR=/home/jwangxgroup/jiewang/shared
+MODEL_PATH=$MODEL_DIR/${1:-"Qwen2.5-Math-7B-16k-think"}
+#MODEL_PATH=${1:-"$HOME/Model/Qwen2.5-Math-7B-16k-think"} #Model/Qwen2.5-Math-7B-16k-think
 echo "Model Path: $MODEL_PATH"
 PROJECT_NAME="calculate_probs_entropy_$(basename $MODEL_PATH)_$(basename $train_path .parquet)"
 EXP_NAME="calculate_probs_entropy"
@@ -19,7 +21,7 @@ LOG_DIR=$HOME/LLM/Train/verl/logs/${PROJECT_NAME}
 mkdir -p ${LOG_DIR}
 LOG_PATH=${LOG_DIR}/${EXP_NAME}.log
 
-GPU_NUM=2
+GPU_NUM=4
 TENSOR_PARALLEL=1
 
 DATA_DIR=$HOME/LLM/Train/data/
@@ -41,9 +43,11 @@ python -m verl.trainer.calculate_probs_entropy \
     data.val_files=$val_files \
     data.train_batch_size=512 \
     data.val_batch_size=512 \
-    data.max_prompt_length=1024 \
+    data.max_prompt_length=4096 \
     data.max_response_length=8192 \
     data.return_full_prompt=True \
+    +data.target_key='se_target' \
+    +data.use_se=False \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=4 \
     data.shuffle=False \

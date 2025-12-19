@@ -111,7 +111,7 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
-        print("GPU设备数量:", world_size)
+        #print("GPU设备数量:", world_size)
         # TODO(sgm): support FSDP hybrid shard for larger model
         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
 
@@ -127,12 +127,11 @@ class NewActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_lora = self._lora_rank > 0
 
         self.role = role
-        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
+        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref",'se_rollout_ref']
 
-        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
-        self._is_ref = self.role in ["ref", "actor_rollout_ref"]
-
+        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref",]
+        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref", ]
+        self._is_ref = self.role in ["ref", "actor_rollout_ref","se_rollout_ref"]
         profiler_config: Optional[ProfilerConfig] = None
         if self._is_actor:
             profiler_config = omega_conf_to_dataclass(config.actor.get("profiler", {}), ProfilerConfig)

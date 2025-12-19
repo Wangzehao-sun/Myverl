@@ -95,3 +95,7 @@ python -m verl.trainer.main_ppo_new \
     +trainer.metrics_data_dir=$LOG_DIR \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=1 $@ 2>&1 | tee ${LOG_PATH}
+
+
+
+actor/grad_norm|actor/off_pg_loss|actor/off_ratio_max_clip_frac|actor/on_pg_loss|batch/on_avg_response_len |batch/on_solved |batch/solve_all |batch/solve_none|batch/entropy_on|batch/entropy_off_se| batch/entropy_off_standard|batch/old_prob_on|batch/old_prob_se_off|batch/old_prob_off_standard|batch/prob_off_se |batch/prob_off_se_var|batch/prob_on|batch/prob_on_var|batch/ratio_on_mean|batch/ratio_off_se_mean

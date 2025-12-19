@@ -145,6 +145,7 @@ def compute_token_on_off_policy_loss(
     cliprange, 
     prefix_mask,
     se_mask,
+    reward_mask,
     cliprange_low=None,
     cliprange_high=None,
     off_max_clip=None, 
@@ -184,6 +185,7 @@ def compute_token_on_off_policy_loss(
     # compute off-policy probability
     
     negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     ratio = torch.exp(negative_approx_kl) # [bsz, l]
@@ -197,7 +199,10 @@ def compute_token_on_off_policy_loss(
     if loss_remove_clip is False:
         on_pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange_low, upper_bound)
         on_pg_clipfrac = verl_F.masked_mean(torch.gt(on_pg_losses2, on_pg_losses).float(), response_mask)
-        on_pg_losses = torch.max(on_pg_losses, on_pg_losses2)
+        on_pg_losses_clip = torch.max(on_pg_losses, on_pg_losses2)
+        on_pg_losses3 = -advantages * 3.0
+        on_pg_losses_clip2 = torch.min(on_pg_losses3, on_pg_losses_clip)
+        on_pg_losses = torch.where(advantages < 0, on_pg_losses_clip2, on_pg_losses_clip)
         on_pg_loss = verl_F.masked_mean(on_pg_losses, (~prefix_mask) * response_mask)
     else:
         on_pg_loss = verl_F.masked_mean(on_pg_losses, (~prefix_mask) * response_mask)
@@ -221,8 +226,9 @@ def compute_token_on_off_policy_loss(
             elif off_policy_reshape == "p_div_p_0.1":
                 off_ratio = off_ratio / (off_ratio + 0.1)
             else:
-                raise ValueError(f"Invalid off_policy_reshape: {off_policy_reshape}")
-        elif off_policy_strategy == "se":
+                off_ratio = off_ratio / (off_ratio + 0.1)
+                #raise ValueError(f"Invalid off_policy_reshape: {off_policy_reshape}")
+        elif off_policy_strategy in ["se","se_filter"]:
             if off_policy_reshape == "sequence":
                 #计算每个序列的ess
                 # 计算每个序列的ess，确保不参与梯度计算
@@ -231,7 +237,17 @@ def compute_token_on_off_policy_loss(
                 batch_size = ratio.shape[0]
                 # ess_seq已经是detached的，不会传递梯度
                 off_ratio = ratio * ess_seq.view(batch_size, 1).expand_as(ratio)
-    
+            elif off_policy_reshape == "p_div_p_0.1":
+                off_ratio = ratio / (ratio + 0.1)
+            elif off_policy_reshape == "rlpluss":
+                detached_log_prob = log_prob.detach()
+                off_ratio = off_ratio * (1 - torch.exp(detached_log_prob))**(0.5)
+            elif off_policy_reshape == "vanilla":
+                off_ratio = torch.exp(negative_approx_kl)
+            elif off_policy_reshape == "filter":
+                off_ratio = torch.exp(negative_approx_kl)* reward_mask
+            elif off_policy_reshape == "cispo":
+                off_ratio = torch.exp(negative_approx_kl).detach() * reward_mask * log_prob
             else:
                 if off_ratio_ess is None:
                     off_ratio = ratio
@@ -287,8 +303,10 @@ def compute_token_on_off_policy_loss(
         detached_log_prob = log_prob.detach()
         explosion_based_advantages  = advantages * (1 - torch.exp(detached_log_prob))**(0.5)
         off_pg_losses = -off_ratio * explosion_based_advantages 
-    elif off_policy_strategy == "se":
-        off_pg_losses = -off_ratio * advantages
+    elif off_policy_strategy in ["se","se_filter"]:
+        clipped_advantages = torch.clamp(advantages, min=0.0)
+        off_pg_losses = -off_ratio * clipped_advantages
+        #off_pg_losses = -off_ratio * advantages
     else:
         off_pg_losses = -off_ratio * advantages
     off_pg_loss = verl_F.masked_mean(off_pg_losses, prefix_mask * response_mask)

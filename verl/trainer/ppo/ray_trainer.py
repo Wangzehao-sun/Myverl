@@ -74,6 +74,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    ActorRolloutSE = 7  # Secondary ActorRollout for SE training
 
 
 @dataclass

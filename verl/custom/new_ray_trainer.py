@@ -19,7 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
-import os
+import os,sys
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -338,7 +338,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                          config=self.config.data,
                                          max_target_length=self.config.actor_rollout_ref.rollout.max_prefix_len,
                                          filter_targets=self.config.data.get('filter_targets', False),
-                                         sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0))
+                                         sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0),
+                                         target_key=self.config.data.get('target_key', 'target'),
+                                         use_se=self.config.data.get('use_se', True),)
 
         # use sampler for better ckpt resume
         if train_sampler is None:
@@ -405,6 +407,26 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 role="actor_rollout",
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+            # 2. [新增] 次要的 ActorRollout (例如用于 SE 生成)
+            # 假设你在 role_worker_mapping 中传入了一个自定义的 key，例如 "ActorRolloutSE"
+            # 并且在 resource_pool_manager 中也配置了对应的资源池
+            if Role.ActorRolloutSE in self.role_worker_mapping:
+                resource_pool_se = self.resource_pool_manager.get_resource_pool(Role.ActorRolloutSE)
+                acl_config = deepcopy(self.config.actor_rollout_ref)
+                se_config = self.config.actor_rollout_se if hasattr(self.config, 'actor_rollout_se') else acl_config
+                # 根据se_config更新acl_config
+                acl_config = OmegaConf.merge(acl_config, se_config)
+                #打印acl_config
+                print("Using SE config for ActorRolloutSE:", acl_config)
+                #print("Using SE config for ActorRolloutSE:", acl_config.model.path)
+                actor_rollout_se_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.ActorRolloutSE],
+                    # 这里可以使用相同的 config，也可以在 config 中定义一个新的 actor_rollout_se 节点
+                    config=acl_config, 
+                    role="se_rollout_ref",
+                )
+                self.resource_pool_to_cls[resource_pool_se]["se_rollout_ref"] = actor_rollout_se_cls
+
         else:
             raise NotImplementedError
 
@@ -462,6 +484,13 @@ class NewRayPPOTrainer(RayPPOTrainer):
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
+
+        # [新增] 初始化第二个 actor_rollout_wg
+        if "se_rollout_ref" in all_wg:
+            self.actor_rollout_se_wg = all_wg["se_rollout_ref"]
+            self.actor_rollout_se_wg.init_model()
+            #print("Secondary ActorRollout (SE) initialized.")
+
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -583,6 +612,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
     
     def _build_hybrid_off_policy_output(
         self,
+        n_divide: int,
         gen_batch: DataProto,
         off_responses: torch.Tensor,
         tgt_list: list,
@@ -602,7 +632,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
         Returns:
             DataProto: 构建完成并经过repeat的off-policy输出。
         """
-        n_on = self.config.actor_rollout_ref.rollout.n - self.config.actor_rollout_ref.rollout.n_off
+        n_on = n_divide
         n_off = self.config.actor_rollout_ref.rollout.n_off
         pad_token_id = self.tokenizer.pad_token_id
         eos_token_id = self.tokenizer.eos_token_id
@@ -688,6 +718,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
         self,
         gen_batch: DataProto,
         off_responses: torch.Tensor,
+        n_split: int,
+        n_off: int,
         train_batch_size: int,
     ) -> DataProto:
         """
@@ -701,22 +733,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
         Returns:
             DataProto: 构建完成的 off-policy 输出，其中 prefix_mask 全为 True。
         """
-        n_on = self.config.actor_rollout_ref.rollout.n - self.config.actor_rollout_ref.rollout.n_off
         
         # 1. 从 on-policy 输出中推导出未经 repeat 的原始 prompts
-        original_prompts = gen_batch.batch['input_ids'][::n_on]
+        original_prompts = gen_batch.batch['input_ids'][::n_split]
 
-        # 2. responses 就是模型生成的 off_responses
-        #    注意：off_responses 的 batch size 已经是 train_batch_size * n_off
-        #    而 original_prompts 的 batch size 是 train_batch_size
-        #    需要将 prompts 进行 repeat 以匹配 responses
-        n_off = self.config.actor_rollout_ref.rollout.n_off
         repeated_prompts = original_prompts.repeat_interleave(n_off, dim=0)
         #打印有效的responses 长度
-        responses_list = [
-            _pre_process_inputs_right_pad(self.tokenizer.pad_token_id, off_responses[i])
-            for i in range(off_responses.size(0))
-        ]
+        # responses_list = [
+        #     _pre_process_inputs_right_pad(self.tokenizer.pad_token_id, off_responses[i])
+        #     for i in range(off_responses.size(0))
+        # ]
         #print("responses_list lengths:", [len(res) for res in responses_list])
         # 3. 构建完整的 input_ids, attention_mask, 和 position_ids
         off_input_ids = torch.cat([repeated_prompts, off_responses], dim=-1)
@@ -792,6 +818,64 @@ class NewRayPPOTrainer(RayPPOTrainer):
 
         return DataProto(batch=merged_batch, meta_info=on_policy_batch.meta_info)
 
+    def _replace_failed_on_policy_with_off_policy(
+        self,
+        on_policy_batch: DataProto,
+        off_policy_batch: DataProto,
+        #reward_info: dict,
+        train_batch_size: int,
+        n: int,
+        n_off: int,
+    ) -> DataProto:
+        """
+        在 se_filter 模式下，检查每个问题（包含 n 个采样）是否全部回答错误。
+        如果是，则用离线数据 off_policy_batch 中对应的条目替换该问题在 on_policy_batch 中的最后一个采样。
+        """
+        # 计算当前生成的reward
+        # 将 reward_info 按插入的方式重复 n 次
+        # reward_info 是一个列表，我们需要将每个元素重复 n 次
+        #repeated_reward_info = [item for item in reward_info for _ in range(n)]
+
+        #on_policy_batch.non_tensor_batch['reward_model'] = repeated_reward_info
+        reward_tensor_on, _ = compute_reward(on_policy_batch, self.reward_fn)
+        
+        # reward_tensor_on 是 token-level 的，需要求和得到每个样本的得分
+        reward_sum = reward_tensor_on.sum(dim=-1)
+        
+        # reshape reward to (train_batch_size, n)
+        rewards_reshaped = reward_sum.view(train_batch_size, n)
+        
+        success_value = 1
+        
+        # 检查每个问题是否全部回答错误
+        has_success = (rewards_reshaped == success_value).any(dim=1)
+        all_wrong_mask = ~has_success
+        all_wrong_indices = torch.nonzero(all_wrong_mask).squeeze(-1)
+        
+        if all_wrong_indices.numel() > 0:
+            print(f"Replacing {all_wrong_indices.numel()} problems' last response with off-policy data.")
+            
+            # 替换每个全错问题的最后一个回复
+            target_indices = all_wrong_indices * n + (n - 1)
+            
+            # gen_batch_off_output 的结构是 (train_batch_size * n_off)
+            # 我们取每个问题的第一个 off-policy 回复
+            source_indices = all_wrong_indices * n_off
+            
+            # 确保 on_policy_batch 中有 off_old_log_probs 字段
+            if 'off_old_log_probs' not in on_policy_batch.batch:
+                on_policy_batch.batch['off_old_log_probs'] = torch.zeros_like(on_policy_batch.batch['responses'], dtype=torch.float32)
+
+            for key in off_policy_batch.batch.keys():
+                if key in on_policy_batch.batch:
+                    on_policy_batch.batch[key][target_indices] = off_policy_batch.batch[key][source_indices]
+                else:
+                    print(f"Key {key} not found in on_policy_batch; skipping replacement for this key.")
+
+                # elif key == 'off_old_log_probs':
+                #     on_policy_batch.batch[key][target_indices] = off_policy_batch.batch[key][source_indices]
+        
+        return on_policy_batch
     def fit(self):
         """
         The training loop of PPO.
@@ -857,11 +941,12 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 #metrics["global_steps"] = self.global_steps
                 #解码打印一条batch se_input_ids中的数据
                 if self.global_steps == 1:
-                    if 'se_input_ids' in batch.batch:
-                        print("se_input_ids[0]:", self.tokenizer.decode(batch.batch['se_input_ids'][0], skip_special_tokens=True))
-                    if 'input_ids' in batch.batch:
-                        print("input_ids[0]:", self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=True))
-                #break
+                    pass
+                #     if 'se_input_ids' in batch.batch:
+                #         print("se_input_ids[0]:", self.tokenizer.decode(batch.batch['se_input_ids'][0], skip_special_tokens=True))
+                #     if 'input_ids' in batch.batch:
+                #         print("input_ids[0]:", self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=True))
+                # #break
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids",]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -892,13 +977,16 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     #提取off-policy的回复内容
                     gen_batch_off = deepcopy(gen_batch)
                     #if 'tgt_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_prefix>0:
+                    #se_tgt_input_ids = None
+                    se_tgt_list = None
                     if 'tgt_input_ids' in batch.batch:
-                        tgt_inputs_ids = batch.batch.pop('tgt_input_ids')
+                        tgt_inputs_ids = deepcopy(batch.batch['tgt_input_ids'])
                         
                         gen_batch_off_standard,tgt_list = self._prepare_off_policy_from_tgt(tgt_inputs_ids, gen_batch_off, train_batch_size, prefix_ratio)
-                    if 'tgt_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_prefix>0:
-                        gen_batch_off = gen_batch_off_standard
-                    elif 'se_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_se>0:
+            
+                        if  self.config.actor_rollout_ref.rollout.n_prefix>0:
+                            gen_batch_off = gen_batch_off_standard
+                    if 'se_input_ids' in batch.batch and self.config.actor_rollout_ref.rollout.n_se>0:
                         gen_batch_off = batch.pop(
                             batch_keys=["se_input_ids", "se_attention_mask", "se_position_ids"],
                         )
@@ -908,6 +996,20 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         #print("gen_batch_off input_ids[0]:", self.tokenizer.decode(gen_batch_off.batch['input_ids'][0], skip_special_tokens=False))
                         gen_batch_off.batch["attention_mask"] = gen_batch_off.batch.pop("se_attention_mask")
                         gen_batch_off.batch["position_ids"] = gen_batch_off.batch.pop("se_position_ids")
+                        if 'se_tgt_input_ids' in batch.batch:
+                            se_tgt_input_ids = batch.batch.pop('se_tgt_input_ids')
+                            pad_token_id = self.tokenizer.pad_token_id
+                            eos_token_id = self.tokenizer.eos_token_id
+
+                            se_tgt_list = [
+                                _pre_process_inputs_right_pad(pad_token_id, se_tgt_input_ids[i]) for i in range(train_batch_size)
+                            ]
+                            #print("tgt_list lengths:", [len(t) for t in tgt_list])
+                            se_tgt_list = [
+                                se_tgt_list[i] + [eos_token_id,] if len(se_tgt_list[i]) > 0 else se_tgt_list[i]
+                                for i in range(train_batch_size)
+                            ]
+                             
                     else:
                         raise ValueError("When using off-policy samples, the training batch must contain 'tgt_input_ids' or 'se_input_ids'.")
                     
@@ -915,8 +1017,11 @@ class NewRayPPOTrainer(RayPPOTrainer):
                     print("使用off-policy样本,batch_size*n_off:", len(gen_batch_off.batch['input_ids']))
                     #print("Last token ids of concatenated sequences:", [seq[-1] if len(seq) > 0 else None for seq in gen_batch_off.batch['input_ids'].tolist()])
                 
-                gen_batch = gen_batch.repeat(repeat_times=n_on, interleave=True)
                 
+                if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=='se_filter':
+                    gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                else:
+                    gen_batch = gen_batch.repeat(repeat_times=n_on, interleave=True)
                 gen_batch.meta_info['global_steps'] = self.global_steps
                 gen_batch.meta_info['is_se'] = False
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -940,17 +1045,21 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         if self.config.actor_rollout_ref.rollout.n_off>0:
                             #为每个prompt构建一个具有标准答案的离线样本，大小为train_batch_size
                             assert n_off==1, "Currently we only support n_off=1."
-                            gen_batch_off_output_standard= self._build_hybrid_off_policy_output(
-                                    gen_batch,
-                                    None,
-                                    tgt_list,
-                                    train_batch_size,
-                                    prefix_ratio,
-                                )
-                            gen_batch_off_output_standard.batch['off_old_log_probs'] = torch.zeros((gen_batch_off_output_standard.batch['responses'].size(0), gen_batch_off_output_standard.batch['responses'].size(1)),dtype=torch.float32)
-                            #为什么要将将非张量数据也复制过去，不是空的吗
-                            gen_batch_off_output_standard.non_tensor_batch = deepcopy(batch.non_tensor_batch)
-                            print("non_tensor_batch keys:", gen_batch_off_output_standard.non_tensor_batch.keys())
+                            if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=="se_luffy":
+                            
+                                gen_batch_off_output_standard= self._build_hybrid_off_policy_output(
+                                        n_on,
+                                        gen_batch,
+                                        None,
+                                        tgt_list,
+                                        train_batch_size,
+                                        prefix_ratio,
+                                    )
+                                gen_batch_off_output_standard.batch['off_old_log_probs'] = torch.zeros((gen_batch_off_output_standard.batch['responses'].size(0), gen_batch_off_output_standard.batch['responses'].size(1)),dtype=torch.float32)
+                                #为什么要将将非张量数据也复制过去，不是空的吗
+                                gen_batch_off_output_standard.non_tensor_batch = deepcopy(batch.non_tensor_batch)
+                                print("non_tensor_batch keys:", gen_batch_off_output_standard.non_tensor_batch.keys())
+            
                             if self.config.actor_rollout_ref.rollout.n_prefix>0:
                                 if self.config.actor_rollout_ref.rollout.prefix_ratio<1.0:
                                     #raise ValueError("When using n_prefix>0, prefix_ratio must be in (0.0, 1.0].")
@@ -965,6 +1074,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                     off_responses = None
                                 
                                 gen_batch_off_output= self._build_hybrid_off_policy_output(
+                                    n_on,
                                     gen_batch,
                                     off_responses,
                                     tgt_list,
@@ -973,17 +1083,40 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                 )
                                 
                             elif self.config.actor_rollout_ref.rollout.n_se>0:
-                                gen_batch_off.meta_info['is_se'] = True
-                                gen_batch_off_output = self.actor_rollout_wg.generate_sequences(gen_batch_off)
-                                timing_raw.update(gen_batch_off_output.meta_info["timing"])
-                                gen_batch_off_output.meta_info.pop("timing", None)
-                                # #打印一下解码的前五条inputs_ids
-                                # for i in range(min(3, len(gen_batch_off_output.batch['input_ids']))):
-                                #     print(f"gen_batch_off_output input_ids[{i}]:", self.tokenizer.decode(gen_batch_off_output.batch['input_ids'][i], skip_special_tokens=False))
-                                #打印prompts的有效长度
-                                #print("gen_batch_off_output prompts lengths:", (gen_batch_off_output.batch['prompts']!=self.tokenizer.pad_token_id).sum(dim=-1).tolist())
 
-                                off_responses = gen_batch_off_output.batch['responses']
+                                gen_batch_output.batch['off_old_log_probs'] = torch.zeros((gen_batch_output.batch['responses'].size(0), gen_batch_output.batch['responses'].size(1)),
+                                           dtype=torch.float32)
+                                
+
+                                gen_batch_off.meta_info['is_se'] = True
+                                se_target = self.config.se.get("target", None)
+                                if se_target == "standard":
+                                    #se_responses =  se_tgt_input_ids
+                                    gen_batch_off_output = self._build_hybrid_off_policy_output(
+                                        n_off,
+                                        gen_batch_off,
+                                        None,
+                                        se_tgt_list,
+                                        train_batch_size,
+                                        1,
+                                    )
+                                elif se_target == "dynamic":
+                                    gen_batch_off_output = self.actor_rollout_wg.generate_sequences(gen_batch_off)
+                                    timing_raw.update(gen_batch_off_output.meta_info["timing"])
+                                    gen_batch_off_output.meta_info.pop("timing", None)
+                                    # #打印一下解码的前五条inputs_ids
+                                    # for i in range(min(3, len(gen_batch_off_output.batch['input_ids']))):
+                                    #     print(f"gen_batch_off_output input_ids[{i}]:", self.tokenizer.decode(gen_batch_off_output.batch['input_ids'][i], skip_special_tokens=False))
+                                    #打印prompts的有效长度
+                                    #print("gen_batch_off_output prompts lengths:", (gen_batch_off_output.batch['prompts']!=self.tokenizer.pad_token_id).sum(dim=-1).tolist())
+                                elif se_target == "synch": #
+                                    gen_batch_off_output = self.actor_rollout_se_wg.generate_sequences(gen_batch_off)
+                                    timing_raw.update(gen_batch_off_output.meta_info["timing"])
+                                    gen_batch_off_output.meta_info.pop("timing", None)
+                                    
+                                se_responses = gen_batch_off_output.batch['responses']
+
+
                                     #将解码后的inputs_ids保存到文件中
                                 se_dir = self.config.trainer.get("rollout_data_dir", None)
                                 if se_dir is not None and se_dir != "" :
@@ -996,28 +1129,64 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                             json_line = json.dumps({"input": inp, "output": out}, ensure_ascii=False)
                                             f.write(json_line + "\n")
                                 
-                                gen_batch_output.batch['off_old_log_probs'] = torch.zeros((gen_batch_output.batch['responses'].size(0), gen_batch_output.batch['responses'].size(1)),
-                                           dtype=torch.float32)
-                                off_old_log_probs = self.actor_rollout_wg.compute_log_prob(gen_batch_off_output)
+                                
+                                if se_target in ["standard",'synch']:
+                                    #如果是标准答案，则不需要计算旧的log概率
+                                    off_old_log_probs = self.actor_rollout_se_wg.compute_ref_log_prob(gen_batch_off_output)
+                                    se_old_log_probs = off_old_log_probs.batch.pop('ref_log_prob')
+                                else:
+                                    off_old_log_probs = self.actor_rollout_wg.compute_log_prob(gen_batch_off_output)
+                                    se_old_log_probs = off_old_log_probs.batch.pop('old_log_probs')
+
                                 gen_batch_off_output = self._build_se_off_policy_output(
                                     gen_batch,
-                                    off_responses,
+                                    se_responses,
+                                    self.config.actor_rollout_ref.rollout.n if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=='se_filter' else n_on,
+                                    n_off,
                                     train_batch_size,
                                 )
-                                gen_batch_off_output.batch['off_old_log_probs'] = off_old_log_probs.batch.pop('old_log_probs')
+                                gen_batch_off_output.batch['off_old_log_probs'] = se_old_log_probs
                     
                             else:
                                 raise ValueError("When using off-policy samples, n_prefix or n_se must be greater than 0.")
                             #gen_batch_off_output.batch['off_old_log_probs'] = off_old_log_probs.batch.pop('old_log_probs')
                     #合并on-policy和off-policy的生成结果
                     if self.config.actor_rollout_ref.rollout.n_off>0:
-                        gen_batch_output = self._merge_on_off_policy_batches(
-                            on_policy_batch=gen_batch_output,
-                            off_policy_batch=gen_batch_off_output,
-                            train_batch_size=train_batch_size,
-                            n_on=n_on,
-                            n_off=n_off,
-                        )
+                        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=='se_filter':
+                            # 获取 batch 中所有的 non_tensor_batch
+                            non_tensor_batch = batch.non_tensor_batch
+                            
+                            # 将 non_tensor_batch 中的每个元素重复 n 次
+                            repeated_non_tensor_batch = {}
+                            n = self.config.actor_rollout_ref.rollout.n
+                            for k, v in non_tensor_batch.items():
+                                if isinstance(v, list):
+                                    repeated_non_tensor_batch[k] = [item for item in v for _ in range(n)]
+                                elif isinstance(v, np.ndarray):
+                                    repeated_non_tensor_batch[k] = np.repeat(v, n, axis=0)
+                                else:
+                                    # 其他类型根据需要处理，这里假设直接复制
+                                    repeated_non_tensor_batch[k] = v # 可能需要更复杂的处理
+
+                            # 将重复后的 non_tensor_batch 赋值给 gen_batch_output
+                            gen_batch_output.non_tensor_batch = repeated_non_tensor_batch
+
+                            #reward_info = batch.non_tensor_batch.get('reward_model', None)
+                            gen_batch_output = self._replace_failed_on_policy_with_off_policy(
+                                on_policy_batch=gen_batch_output,
+                                off_policy_batch=gen_batch_off_output,
+                                train_batch_size=train_batch_size,
+                                n=self.config.actor_rollout_ref.rollout.n,
+                                n_off=n_off,
+                            )
+                        else:
+                            gen_batch_output = self._merge_on_off_policy_batches(
+                                on_policy_batch=gen_batch_output,
+                                off_policy_batch=gen_batch_off_output,
+                                train_batch_size=train_batch_size,
+                                n_on=n_on,
+                                n_off=n_off,
+                            )
                     assert len(gen_batch_output.batch['input_ids']) == train_batch_size * self.config.actor_rollout_ref.rollout.n, \
                         f"Expected {train_batch_size * self.config.actor_rollout_ref.rollout.n} input_ids, but got {len(gen_batch_output.batch['input_ids'])}"
                     #打印合并后的prefix_mask列表：
@@ -1053,7 +1222,9 @@ class NewRayPPOTrainer(RayPPOTrainer):
                                            dtype=torch.bool)
                         elif self.config.actor_rollout_ref.rollout.n_se>0:
                             batch.batch['se_mask'] = deepcopy(batch.batch['prefix_mask'])
-
+                    else:
+                        batch.batch['se_mask'] = torch.zeros((batch.batch['responses'].size(0), batch.batch['responses'].size(1)),
+                                           dtype=torch.bool)
                     metrics['batch/avg_prefix_ratio'] = prefix_ratio
                     
                     # Balance the number of valid tokens across DP ranks.
@@ -1085,7 +1256,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         uids = batch.non_tensor_batch['uid']
                         unique_uids = np.unique(uids)
                         valid_mask = torch.ones(len(uids), dtype=torch.bool)
-                        if self.config.data.reward_impl_version == 3:
+                        if self.config.data.reward_impl_version == 3 or self.config.data.reward_impl_version == 4:
                             fail_value = 0
                             success_value = 1
                             format_value = -1
@@ -1094,6 +1265,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         solve_none = 0
                         solve_all = 0
                         solve_none_format = 0
+                        solve_one = 0
+                        #if self.config.actor_rollout_ref.actor.policy_loss.loss_mode=="se_filter":
+                        reward_mask = torch.ones((batch.batch['responses'].size(0), batch.batch['responses'].size(1)), dtype=torch.bool)
+
                         for uid in unique_uids:
                             uid_mask = uids == uid
                             uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
@@ -1108,6 +1283,10 @@ class NewRayPPOTrainer(RayPPOTrainer):
                             elif (uid_rewards == format_value).all():
                                 valid_mask[uid_mask] = False
                                 solve_none_format += 1
+                            # 如果只有一个对的
+                            elif (uid_rewards == success_value).sum() == 1:
+                                reward_mask[uid_mask,:] = True
+                                solve_one += 1
                         if not self.config.algorithm.get("filter_reward",True):
                             # if self.config.trainer.skip_valid_mask:
                             valid_mask[:] = True
@@ -1120,7 +1299,8 @@ class NewRayPPOTrainer(RayPPOTrainer):
                         metrics['batch/solve_none'] = solve_none
                         metrics['batch/solve_none_format'] = solve_none_format
                         metrics['batch/solve_all'] = solve_all
-
+                        metrics['batch/solve_one'] = solve_one
+                        batch.batch['reward_mask'] = reward_mask
                         # add more metrics
                         metrics['batch/solved'] = (reward_tensor.sum(-1) == success_value).sum().item() / len(uids)
                         metrics['batch/failed'] = (reward_tensor.sum(-1) == fail_value).sum().item() / len(uids)
@@ -1390,6 +1570,7 @@ class NewRayPPOTrainer(RayPPOTrainer):
                 #sleep for a while to let the logging finish
                 
                 time.sleep(10)
+                sys.stdout.flush()
                 if do_profile:
                     self.actor_rollout_wg.stop_profile()
                     if self.use_reference_policy:

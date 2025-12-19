@@ -119,7 +119,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages","prefix_mask",'se_mask']
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages","prefix_mask",'se_mask','reward_mask']
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -142,7 +142,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
         batch_size = data.batch.batch_size[0]
-        print(f"--- new_dp_actor.py, total data size: {data.batch.batch_size} ---")
+        #print(f"--- new_dp_actor.py, total data size: {data.batch.batch_size} ---")
 
         metrics = {}
         all_reconstructed_log_probs = None
@@ -269,7 +269,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                         append_to_dict(metrics, metrics_data)
-                    elif self.config.policy_loss.loss_mode in ["luffy","rlpluss","se",'se_luffy']:
+                    elif self.config.policy_loss.loss_mode in ["luffy","rlpluss","se",'se_luffy','se_filter']:
                         from .new_metrics import get_ratio_stats
                         # ratio_stats = get_ratio_stats(old_log_prob=old_log_prob,
                         #     log_prob=log_prob,
@@ -285,6 +285,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                         prefix_mask = data['prefix_mask'] if 'prefix_mask' in data else None
                         se_mask = data['se_mask'] if 'se_mask' in data else None
                         target_probs = data['target_probs'] if 'target_probs' in data else None
+                        reward_mask = data['reward_mask'] if 'reward_mask' in data else None
                         # clip_upper_bound 默认为1.0
                         # off_policy的裁剪默认为False
                         off_policy_reshape = self.config.policy_loss.get("off_policy_reshape", "p_div_p_0.1")
@@ -306,6 +307,7 @@ class NewDataParallelPPOActor(DataParallelPPOActor):
                             loss_remove_token_mean=self.config.loss_remove_token_mean,
                             loss_remove_clip=self.config.loss_remove_clip,
                             off_ratio_ess=off_ratio_ess,
+                            reward_mask=reward_mask,
                         )
                         pg_loss = ret_dict['pg_loss']
                         off_pg_loss = ret_dict['off_pg_loss']
